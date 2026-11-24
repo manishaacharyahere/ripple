@@ -1,0 +1,79 @@
+# Hand-written to match api/v1alpha1/types.go.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: modulereleases.ripple.dev
+spec:
+  group: ripple.dev
+  names:
+    kind: ModuleRelease
+    listKind: ModuleReleaseList
+    plural: modulereleases
+    singular: modulerelease
+    shortNames: [mrel]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - { name: From, type: string, jsonPath: .spec.from }
+        - { name: To, type: string, jsonPath: .spec.to }
+        - { name: Phase, type: string, jsonPath: .status.phase }
+        - { name: Wave, type: string, jsonPath: .status.currentWave }
+        - { name: Reason, type: string, jsonPath: .status.reason, priority: 1 }
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [repo, from, to, waves]
+              properties:
+                repo: { type: string, minLength: 1 }
+                from: { type: string, minLength: 1 }
+                to: { type: string, minLength: 1 }
+                runnerImage: { type: string, default: "ripple-runner:dev" }
+                waves:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [name, consumers]
+                    properties:
+                      name:
+                        type: string
+                        pattern: '^[a-z0-9]([-a-z0-9]{0,18}[a-z0-9])?$'
+                      consumers:
+                        type: array
+                        minItems: 1
+                        items: { type: string, minLength: 1 }
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Halted, Succeeded]
+                currentWave: { type: string }
+                reason: { type: string }
+                observedGeneration: { type: integer, format: int64 }
+                results:
+                  type: array
+                  items:
+                    type: object
+                    required: [wave, consumer, job, status]
+                    properties:
+                      wave: { type: string }
+                      consumer: { type: string }
+                      job: { type: string }
+                      status: { type: string }
+                      create: { type: integer }
+                      update: { type: integer }
+                      replace: { type: integer }
+                      delete: { type: integer }
+                      message: { type: string }

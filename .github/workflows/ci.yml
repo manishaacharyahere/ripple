@@ -1,0 +1,48 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:4.4
+        ports: ["4566:4566"]
+        env:
+          SERVICES: s3,iam,sts,kms
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - name: Wait for LocalStack
+        run: |
+          for i in $(seq 1 30); do curl -sf http://localhost:4566/_localstack/health && exit 0; sleep 2; done
+          exit 1
+      - name: Test (unit, fault injection, LocalStack integration)
+        env:
+          RIPPLE_ENDPOINT: http://localhost:4566
+        run: go test -race -timeout 20m ./...
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ripple-runner:ci .
+      - name: Smoke test
+        # no arguments prints usage and exits 1; GitHub's bash uses pipefail, so capture first
+        run: |
+          out=$(docker run --rm ripple-runner:ci 2>&1 || true)
+          echo "$out" | grep -q 'usage:'

@@ -1,0 +1,81 @@
+# The operator only acts inside the ripple namespace, so it gets a Role, not a ClusterRole.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ripple-operator
+  namespace: ripple
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ripple-operator
+  namespace: ripple
+rules:
+  - apiGroups: [ripple.dev]
+    resources: [modulereleases]
+    verbs: [get, list, watch]
+  - apiGroups: [ripple.dev]
+    resources: [modulereleases/status]
+    verbs: [get, update, patch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch] # termination messages carry the verdict
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ripple-operator
+  namespace: ripple
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ripple-operator
+subjects:
+  - kind: ServiceAccount
+    name: ripple-operator
+    namespace: ripple
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ripple-operator
+  namespace: ripple
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: ripple-operator }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: ripple-operator }
+    spec:
+      serviceAccountName: ripple-operator
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: operator
+          image: ripple-runner:dev
+          imagePullPolicy: IfNotPresent
+          args: [operator, --namespace=ripple]
+          ports:
+            - { name: metrics, containerPort: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }

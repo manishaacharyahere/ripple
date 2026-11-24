@@ -1,0 +1,33 @@
+# Two releases of terraform-aws-modules/s3-bucket, rolled out wave by wave.
+apiVersion: ripple.dev/v1alpha1
+kind: ModuleRelease
+metadata:
+  name: s3-v5-0-1
+  namespace: ripple
+spec:
+  repo: https://github.com/terraform-aws-modules/terraform-aws-s3-bucket
+  from: v5.0.0
+  to: v5.0.1
+  waves:
+    - name: dev
+      consumers: [examples/object]
+    - name: prod
+      consumers: [examples/s3-inventory, examples/s3-analytics]
+---
+# account-public-access uses S3 Control, which LocalStack's free tier does not
+# emulate, so its check cannot produce a verdict. The rollout must fail closed:
+# halt in dev and never start prod.
+apiVersion: ripple.dev/v1alpha1
+kind: ModuleRelease
+metadata:
+  name: s3-v5-0-1-fail-closed
+  namespace: ripple
+spec:
+  repo: https://github.com/terraform-aws-modules/terraform-aws-s3-bucket
+  from: v5.0.0
+  to: v5.0.1
+  waves:
+    - name: dev
+      consumers: [examples/object, examples/account-public-access]
+    - name: prod
+      consumers: [examples/s3-inventory]

@@ -1,0 +1,47 @@
+# Shared infrastructure for runner Jobs. The operator creates the Jobs
+# themselves (internal/controller/job.go), one per consumer check, each with
+# its own LocalStack sidecar.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ripple
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ripple-runner
+  namespace: ripple
+automountServiceAccountToken: false # the runner never talks to the Kubernetes API
+---
+# Runner pods may resolve DNS and reach HTTPS on the internet (git clone,
+# Terraform registry). Nothing in the cluster, no cloud metadata endpoint,
+# and no inbound traffic. The LocalStack sidecar is on localhost, which
+# NetworkPolicy does not filter.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ripple-runner
+  namespace: ripple
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ripple-runner
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - { protocol: TCP, port: 443 }

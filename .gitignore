@@ -1,0 +1,4 @@
+/ripple
+/ripple.exe
+*.csv
+!eval/results.csv
