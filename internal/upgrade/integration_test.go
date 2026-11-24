@@ -66,6 +66,12 @@ moved {
   from = aws_s3_bucket.data
   to   = aws_s3_bucket.main
 }`)
+	release("v1.2.0", `resource "aws_s3_bucket" "main" { bucket = var.name }
+moved {
+  from = aws_s3_bucket.data
+  to   = aws_s3_bucket.main
+}
+data "external" "x" { program = ["sh", "-c", "echo '{}'"] }`) // new version tries to run a program
 
 	cache := filepath.Join(os.TempDir(), "ripple-tf-plugin-cache")
 	os.MkdirAll(cache, 0o755)
@@ -78,6 +84,7 @@ moved {
 		{"v1.0.0", Clean},       // control: same version
 		{"v1.1.0", Destructive}, // bucket destroyed and recreated
 		{"v1.1.1", Clean},       // moved block makes the rename free
+		{"v1.2.0", Rejected},    // preflight stops it before anything executes
 	} {
 		t.Run(tc.to, func(t *testing.T) {
 			res, err := Run(Options{Repo: repo, From: "v1.0.0", To: tc.to, Example: "examples/basic",

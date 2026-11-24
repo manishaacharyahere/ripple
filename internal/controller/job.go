@@ -21,7 +21,9 @@ const (
 	LabelRunner     = "app.kubernetes.io/name" // matched by the runner NetworkPolicy
 	RunnerLabelVal  = "ripple-runner"
 	AnnConsumer     = "ripple.dev/consumer"
-	runnerContainer = "runner"
+	planContainer   = "plan"    // untrusted: runs Terraform, writes only evidence
+	runnerContainer = "verdict" // trusted: classifies evidence, writes the termination message
+	evidencePath    = "/evidence/evidence.json"
 )
 
 // jobName is deterministic in (release, spec, wave, consumer): a crashed or
@@ -83,36 +85,58 @@ func buildJob(rel *ripplev1.ModuleRelease, wave, consumer string) *batchv1.Job {
 							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m"), corev1.ResourceMemory: resource.MustParse("512Mi")},
 							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 						},
-					}},
-					Containers: []corev1.Container{{
-						Name:            runnerContainer,
+					}, {
+						// Regular init container: runs after the sidecar is ready and must exit
+						// 0 for the verdict container to start (it does whenever evidence exists).
+						Name:            planContainer,
 						Image:           image,
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Args: []string{"upgrade-plan",
 							"--repo=" + rel.Spec.Repo, "--example=" + consumer,
 							"--endpoint=http://localhost:4566", "--workdir=/work/run",
-							"--result-file=/dev/termination-log",
+							"--evidence-file=" + evidencePath,
 							rel.Spec.From, rel.Spec.To},
-						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-						SecurityContext: &corev1.SecurityContext{
-							RunAsNonRoot:             ptr.To(true),
-							RunAsUser:                ptr.To[int64](10001),
-							ReadOnlyRootFilesystem:   ptr.To(true),
-							AllowPrivilegeEscalation: ptr.To(false),
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						SecurityContext: restricted(),
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "work", MountPath: "/work"}, {Name: "tmp", MountPath: "/tmp"}, {Name: "evidence", MountPath: "/evidence"},
 						},
-						VolumeMounts: []corev1.VolumeMount{{Name: "work", MountPath: "/work"}, {Name: "tmp", MountPath: "/tmp"}},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("512Mi")},
 							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
 						},
 					}},
+					// The verdict container never runs Terraform, so nothing the module or its
+					// providers execute can write the termination message the operator trusts.
+					Containers: []corev1.Container{{
+						Name:                     runnerContainer,
+						Image:                    image,
+						ImagePullPolicy:          corev1.PullIfNotPresent,
+						Args:                     []string{"verdict", "--evidence-file=" + evidencePath, "--result-file=/dev/termination-log"},
+						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+						SecurityContext:          restricted(),
+						VolumeMounts:             []corev1.VolumeMount{{Name: "evidence", MountPath: "/evidence", ReadOnly: true}},
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+							Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+						},
+					}},
 					Volumes: []corev1.Volume{
 						{Name: "work", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
 						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("512Mi"))}}},
+						{Name: "evidence", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("64Mi"))}}},
 					},
 				},
 			},
 		},
+	}
+}
+
+func restricted() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		RunAsNonRoot:             ptr.To(true),
+		RunAsUser:                ptr.To[int64](10001),
+		ReadOnlyRootFilesystem:   ptr.To(true),
+		AllowPrivilegeEscalation: ptr.To(false),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 }

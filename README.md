@@ -63,8 +63,18 @@ switch only shows up in a plan. `upgrade-plan` measures it on a real consumer:
 3. Keep the consumer's code and state, swap the module underneath to the
    **new** version, and plan.
 4. Classify: `clean`, `changes` (creates/updates), `destructive`
-   (deletes/replaces), or `plan-failed` (the consumer no longer works).
+   (deletes/replaces), `plan-failed` (the consumer no longer works) or
+   `rejected` (preflight refused it, below).
 5. Destroy the baseline.
+
+**Preflight.** `terraform init` downloads code but runs none of it. After
+every init, before any plan or apply, Ripple reads every module directory
+init resolved (`.terraform/modules/modules.json`) and the provider lock file,
+and rejects provisioners (including destroy-time ones in `removed` blocks),
+`data "external"`, JSON configuration it cannot inspect, and providers
+outside an allow-list (`hashicorp/aws`, `random`, `null`, `tls`, `time` by
+default; `--allow-providers` to change). Those are the ways module code can
+run programs or write files in the runner, and so forge a result.
 
 ```
 $ ripple upgrade-plan --repo ./my-module --example examples/basic \
@@ -83,6 +93,12 @@ the dummy `test`/`test`, so a misconfiguration cannot touch a real account.
 
 - **LocalStack as a native sidecar** in every pod, so parallel checks never
   share or collide on emulated state.
+- **Untrusted and trusted halves in separate containers.** A `plan` init
+  container runs Terraform and writes only raw evidence
+  (`ripple upgrade-plan --evidence-file`); the `verdict` container never runs
+  Terraform, mounts the evidence read-only, classifies it
+  (`ripple verdict`) and writes the termination message the operator reads.
+  Evidence cannot assert its own verdict: only failure states pass through.
 - Non-root, read-only root filesystem, all capabilities dropped, seccomp
   `RuntimeDefault`, no service-account token.
 - NetworkPolicy: DNS plus outbound HTTPS only (git, Terraform registry); no
@@ -128,8 +144,11 @@ Design choices, each covered by a test:
 - **Deterministic Job names** derived from (release UID, spec, wave,
   consumer). A restarted operator re-creating a Job gets `AlreadyExists`
   instead of a duplicate run; changing `spec.to` starts a fresh set of checks.
-- **Fail closed.** A Job that ends without a verdict (OOM, deadline, lost
-  pod) halts the rollout instead of passing it.
+- **Fail closed, without false halts.** A Job that ends without a verdict
+  (OOM, deadline, lost pod, preflight rejection) halts the rollout. Because
+  Jobs and pods are cached separately, a just-finished Job gets a 60 s grace
+  period (rechecked every 5 s) for its pod's verdict to arrive before it
+  counts as missing.
 - **Least privilege.** Namespaced Role; runners get no service-account token.
 
 ## Testing the operator against faults
@@ -147,6 +166,9 @@ borrow from two systems papers on controller reliability:
   (1) no wave starts before every earlier check passed, (2) there is never
   more than one Job per consumer, and (3) once faults stop, the release ends
   `Succeeded` iff every verdict passed, otherwise `Halted`.
+
+A further test covers the cache race the random test cannot reach: a Job that
+looks finished before its pod's verdict is cached must wait, not halt.
 
 To check the tests themselves, three bugs were planted one at a time
 (a missing verdict counts as passing; the next wave starts without waiting;
@@ -189,3 +211,11 @@ the declared bump against the one Ripple requires. See [eval/RESULTS.md](eval/RE
   passing wave is a gate; the PR step needs a GitHub App and real consumer repos.
 - Consumers outside the module repo. Checks use the module's own `examples/*`
   as stand-in consumers.
+
+## Residual trust
+
+Preflight blocks the ways module code can run programs or write files, and
+the verdict is computed in a container that never runs Terraform. What
+remains trusted is the allow-listed providers themselves (fetched from the
+Terraform Registry and checked against its signatures by `terraform init`):
+a malicious provider binary could still lie in the plan it produces.

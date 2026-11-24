@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -29,9 +30,27 @@ import (
 // produced no verdict at all, halts the rollout: fail closed.
 var passing = map[string]bool{"clean": true, "changes": true}
 
+const (
+	// verdictGrace is how long a finished Job may show no verdict before it
+	// counts as "error". Jobs and pods are cached by separate informers, so
+	// the Job can look finished before its pod's termination message arrives.
+	verdictGrace = 60 * time.Second
+	// verdictRecheck paces those re-reads: pods aren't watched, so no event
+	// would wake the reconciler when the message lands.
+	verdictRecheck = 5 * time.Second
+)
+
 type ReleaseReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	Now    func() time.Time // nil = time.Now; tests set it
+}
+
+func (r *ReleaseReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -60,6 +79,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	next := ripplev1.ModuleReleaseStatus{ObservedGeneration: rel.Generation}
+	awaiting := false // some finished Job's verdict may still be in flight
 	for _, wave := range rel.Spec.Waves {
 		next.CurrentWave = wave.Name
 		var missing []string
@@ -70,12 +90,13 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				missing = append(missing, consumer)
 				continue
 			}
-			res, done, err := r.result(ctx, job, wave.Name, consumer)
+			res, st, err := r.result(ctx, job, wave.Name, consumer)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if !done {
+			if st != checkDone {
 				running = true
+				awaiting = awaiting || st == checkAwaitingVerdict
 				continue
 			}
 			next.Results = append(next.Results, res)
@@ -101,7 +122,11 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		if running {
 			next.Phase = ripplev1.PhaseRunning
-			return ctrl.Result{}, r.writeStatus(ctx, &rel, next)
+			res := ctrl.Result{}
+			if awaiting {
+				res.RequeueAfter = verdictRecheck
+			}
+			return res, r.writeStatus(ctx, &rel, next)
 		}
 		// Wave passed: fall through to the next one.
 	}
@@ -125,15 +150,25 @@ func (r *ReleaseReconciler) createJob(ctx context.Context, rel *ripplev1.ModuleR
 	return err
 }
 
-// result reads a finished Job's verdict from its runner's termination message.
-func (r *ReleaseReconciler) result(ctx context.Context, job *batchv1.Job, wave, consumer string) (ripplev1.CheckResult, bool, error) {
+type checkState int
+
+const (
+	checkRunning checkState = iota
+	checkAwaitingVerdict
+	checkDone
+)
+
+// result reads a finished Job's verdict from the verdict container's
+// termination message.
+func (r *ReleaseReconciler) result(ctx context.Context, job *batchv1.Job, wave, consumer string) (ripplev1.CheckResult, checkState, error) {
 	res := ripplev1.CheckResult{Wave: wave, Consumer: consumer, Job: job.Name}
-	if !jobFinished(job) {
-		return res, false, nil
+	finishedAt, finished := jobFinished(job)
+	if !finished {
+		return res, checkRunning, nil
 	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace), client.MatchingLabels{"batch.kubernetes.io/job-name": job.Name}); err != nil {
-		return res, false, err
+		return res, checkRunning, err
 	}
 	for _, p := range pods.Items {
 		for _, cs := range p.Status.ContainerStatuses {
@@ -150,20 +185,25 @@ func (r *ReleaseReconciler) result(ctx context.Context, job *batchv1.Job, wave, 
 			}
 			res.Status, res.Create, res.Update, res.Replace, res.Delete = v.Status, v.Create, v.Update, v.Replace, v.Delete
 			res.Message = errorLine(v.Error)
-			return res, true, nil
+			return res, checkDone, nil
 		}
 	}
-	res.Status, res.Message = "error", "job finished without a verdict (runner crashed, timed out or pod was lost)"
-	return res, true, nil
+	if r.now().Sub(finishedAt) < verdictGrace {
+		return res, checkAwaitingVerdict, nil // the pod cache may not have caught up yet
+	}
+	res.Status, res.Message = "error", "job finished without a verdict (runner crashed, timed out, was rejected before evidence, or pod was lost)"
+	return res, checkDone, nil
 }
 
-func jobFinished(job *batchv1.Job) bool {
+// jobFinished reports whether the Job ended and when. A zero time (no
+// timestamp recorded) counts as long ago, so it never delays a verdict.
+func jobFinished(job *batchv1.Job) (time.Time, bool) {
 	for _, c := range job.Status.Conditions {
 		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
-			return true
+			return c.LastTransitionTime.Time, true
 		}
 	}
-	return false
+	return time.Time{}, false
 }
 
 func (r *ReleaseReconciler) writeStatus(ctx context.Context, rel *ripplev1.ModuleRelease, next ripplev1.ModuleReleaseStatus) error {

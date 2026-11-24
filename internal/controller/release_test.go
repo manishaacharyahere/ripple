@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -119,11 +120,13 @@ func (e *env) finish(job *batchv1.Job, verdict string) {
 
 func (e *env) finishWave(wave string, verdict func(consumer string) string) {
 	for _, j := range e.jobs() {
-		if j.Labels[LabelWave] == wave && !jobFinished(&j) {
+		if j.Labels[LabelWave] == wave && !finished(&j) {
 			e.finish(&j, verdict(j.Annotations[AnnConsumer]))
 		}
 	}
 }
+
+func finished(j *batchv1.Job) bool { _, ok := jobFinished(j); return ok }
 
 func all(v string) func(string) string { return func(string) string { return v } }
 
@@ -396,7 +399,7 @@ func TestRandomFaultSchedules(t *testing.T) {
 			switch rng.Intn(4) {
 			case 0: // a running Job finishes
 				for _, j := range e.jobs() {
-					if !jobFinished(&j) {
+					if !finished(&j) {
 						c := j.Annotations[AnnConsumer]
 						assigned[c] = verdicts[rng.Intn(len(verdicts))]
 						e.finish(&j, assigned[c])
@@ -425,7 +428,7 @@ func TestRandomFaultSchedules(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			e.mustReconcile()
 			for _, j := range e.jobs() {
-				if !jobFinished(&j) {
+				if !finished(&j) {
 					c := j.Annotations[AnnConsumer]
 					assigned[c] = verdicts[rng.Intn(len(verdicts))]
 					e.finish(&j, assigned[c])
@@ -452,5 +455,36 @@ func TestRandomFaultSchedules(t *testing.T) {
 		if rel.Status.Phase != want {
 			t.Fatalf("seed %d: final phase %s, want %s (verdicts %v)", seed, rel.Status.Phase, want, assigned)
 		}
+	}
+}
+
+// A Job can look finished in the cache before its pod's termination message
+// does (separate informers). That must wait and recheck, not halt; only a
+// verdict still missing after the grace period fails closed.
+func TestVerdictGraceAvoidsFalseHalt(t *testing.T) {
+	e := newEnv(t, waves()...)
+	e.mustReconcile()
+	t0 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	for _, j := range e.jobs() {
+		j.Status.Conditions = append(j.Status.Conditions, batchv1.JobCondition{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(t0)})
+		if err := e.c.Status().Update(e.ctx, &j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := func(d time.Duration) ctrl.Result {
+		r := &ReleaseReconciler{Client: e.c, Scheme: e.scheme, Now: func() time.Time { return t0.Add(d) }}
+		res, err := r.Reconcile(e.ctx, ctrl.Request{NamespacedName: e.rel})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := at(10 * time.Second); res.RequeueAfter == 0 || e.release().Status.Phase != ripplev1.PhaseRunning {
+		t.Fatalf("within grace: requeue=%v phase=%s, want a recheck while Running", res.RequeueAfter, e.release().Status.Phase)
+	}
+	at(2 * time.Minute)
+	if rel := e.release(); rel.Status.Phase != ripplev1.PhaseHalted {
+		t.Fatalf("after grace: phase %s, want Halted", rel.Status.Phase)
 	}
 }

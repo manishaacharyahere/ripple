@@ -20,7 +20,8 @@ const exitUnderBumped = 2
 const usage = `usage:
   ripple diff [--from v1.2.0 --to v1.3.0] [--json] OLD_DIR NEW_DIR
   ripple diff --repo PATH [--path SUBDIR] [--json] OLD_REF NEW_REF
-  ripple upgrade-plan --repo PATH|URL --example DIR --endpoint URL OLD_REF NEW_REF
+  ripple upgrade-plan --repo PATH|URL --example DIR --endpoint URL [--evidence-file F] OLD_REF NEW_REF
+  ripple verdict --evidence-file F [--result-file F]
   ripple operator [--namespace ripple]
 `
 
@@ -31,6 +32,9 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "upgrade-plan" {
 		return runUpgrade(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "verdict" {
+		return runVerdict(args[1:], stdout, stderr)
 	}
 	if len(args) > 0 && args[0] == "operator" {
 		return runOperator(args[1:], stderr)

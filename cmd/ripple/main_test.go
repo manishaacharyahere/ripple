@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -40,5 +42,24 @@ func TestJSON(t *testing.T) {
 	}
 	if r.Required != "major" || r.Declared != "minor" || r.Verdict != "under-bumped" || len(r.Changes) == 0 {
 		t.Fatalf("unexpected report: %+v", r)
+	}
+}
+
+func TestVerdictCommand(t *testing.T) {
+	dir := t.TempDir()
+	ev := filepath.Join(dir, "evidence.json")
+	os.WriteFile(ev, []byte(`{"repo":"r","example":"e","from":"v1","to":"v2","control":[],"upgrade":[{"address":"a.b","actions":["delete","create"]}]}`), 0o644)
+	res := filepath.Join(dir, "result")
+	var out, errb bytes.Buffer
+	if got := run([]string{"verdict", "--evidence-file", ev, "--result-file", res}, &out, &errb); got != exitHarmful {
+		t.Fatalf("exit %d, want %d (%s)", got, exitHarmful, errb.String())
+	}
+	b, _ := os.ReadFile(res)
+	var r struct {
+		Status  string
+		Replace int
+	}
+	if err := json.Unmarshal(b, &r); err != nil || r.Status != "destructive" || r.Replace != 1 {
+		t.Fatalf("result file %s (%v)", b, err)
 	}
 }

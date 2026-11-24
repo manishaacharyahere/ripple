@@ -29,6 +29,8 @@ type Options struct {
 	Terraform string // terraform binary (default "terraform")
 	WorkDir   string // scratch space; created if missing
 	Log       io.Writer
+	// AllowedProviders overrides DefaultAllowedProviders for preflight.
+	AllowedProviders []string
 }
 
 type Status string
@@ -39,7 +41,22 @@ const (
 	Destructive    Status = "destructive"     // something is deleted or replaced
 	PlanFailed     Status = "plan-failed"     // consumer code no longer works with the new module
 	BaselineFailed Status = "baseline-failed" // old version could not be applied; result inconclusive
+	Rejected       Status = "rejected"        // preflight found something that could run arbitrary code
 )
+
+// Evidence is what the untrusted half of a check produces: raw plan changes
+// (control and upgrade) or the failure that stopped it. Verdict turns it into
+// a Result; in Kubernetes the two halves run in different containers.
+type Evidence struct {
+	Repo    string           `json:"repo"`
+	Example string           `json:"example"`
+	From    string           `json:"from"`
+	To      string           `json:"to"`
+	Status  Status           `json:"status,omitempty"` // set only when collection stopped early
+	Error   string           `json:"error,omitempty"`
+	Control []ResourceChange `json:"control"`
+	Upgrade []ResourceChange `json:"upgrade"`
+}
 
 type ResourceChange struct {
 	Address string   `json:"address"`
@@ -61,9 +78,37 @@ type Result struct {
 	Changes []ResourceChange `json:"changes"`
 }
 
-// Run never returns a nil Result when err is nil; err is reserved for
-// infrastructure problems (git, filesystem), not for the module breaking.
+// Run collects evidence and classifies it in one process (local use).
 func Run(o Options) (*Result, error) {
+	ev, err := Collect(o)
+	if err != nil {
+		return nil, err
+	}
+	return Verdict(ev)
+}
+
+// Verdict classifies evidence. It never runs Terraform, so it can run in a
+// container that untrusted code never touches.
+func Verdict(ev *Evidence) (*Result, error) {
+	res := &Result{Repo: ev.Repo, Example: ev.Example, From: ev.From, To: ev.To, Changes: []ResourceChange{}}
+	if ev.Status != "" {
+		switch ev.Status {
+		case BaselineFailed, PlanFailed, Rejected:
+		default:
+			return nil, fmt.Errorf("evidence has unknown status %q", ev.Status)
+		}
+		res.Status, res.Error = ev.Status, ev.Error
+		return res, nil
+	}
+	if err := classify(res, ev.Upgrade, ev.Control); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// Collect never returns nil Evidence when err is nil; err is reserved for
+// infrastructure problems (git, filesystem), not for the module breaking.
+func Collect(o Options) (*Evidence, error) {
 	if err := checkEndpoint(o.Endpoint); err != nil {
 		return nil, err
 	}
@@ -73,10 +118,17 @@ func Run(o Options) (*Result, error) {
 	if o.Log == nil {
 		o.Log = io.Discard
 	}
+	if o.AllowedProviders == nil {
+		o.AllowedProviders = DefaultAllowedProviders
+	}
 	if err := os.MkdirAll(o.WorkDir, 0o755); err != nil {
 		return nil, err
 	}
-	res := &Result{Repo: o.Repo, Example: o.Example, From: o.From, To: o.To, Changes: []ResourceChange{}}
+	ev := &Evidence{Repo: o.Repo, Example: o.Example, From: o.From, To: o.To, Control: []ResourceChange{}, Upgrade: []ResourceChange{}}
+	stop := func(st Status, step, out string) *Evidence {
+		ev.Status, ev.Error = st, step+": "+tail(out)
+		return ev
+	}
 
 	repo := o.Repo
 	if isRemote(repo) {
@@ -101,10 +153,25 @@ func Run(o Options) (*Result, error) {
 	}
 
 	tf := func(dir string, args ...string) (string, error) { return terraform(o, dir, args...) }
+	// init downloads but executes nothing; preflight then checks everything init resolved
+	// before any plan or apply runs provider or module code.
+	initChecked := func(dir string, args ...string) (string, error) {
+		out, err := tf(dir, append([]string{"init", "-input=false", "-no-color"}, args...)...)
+		if err != nil {
+			return out, err
+		}
+		if err := preflight(dir, o.AllowedProviders); err != nil {
+			return err.Error(), err
+		}
+		return out, nil
+	}
 
 	// 1. Baseline: the consumer as it runs today.
-	if out, err := tf(oldEx, "init", "-input=false", "-no-color"); err != nil {
-		return baselineFailed(res, "init", out), nil
+	if out, err := initChecked(oldEx); err != nil {
+		if errors.Is(err, ErrRejected) {
+			return stop(Rejected, "preflight (old version)", out), nil
+		}
+		return stop(BaselineFailed, "init", out), nil
 	}
 	// Tear down even after a failed or partial apply so reruns start clean.
 	defer func() {
@@ -113,14 +180,15 @@ func Run(o Options) (*Result, error) {
 		}
 	}()
 	if out, err := tf(oldEx, "apply", "-auto-approve", "-input=false", "-no-color"); err != nil {
-		return baselineFailed(res, "apply", out), nil
+		return stop(BaselineFailed, "apply", out), nil
 	}
 	// Control: re-plan the unchanged version. Whatever shows up is emulator
 	// drift (e.g. LocalStack not echoing tags_all), not the upgrade's doing.
 	noise, err := planChanges(o, oldEx)
 	if err != nil {
-		return baselineFailed(res, "control plan", err.Error()), nil
+		return stop(BaselineFailed, "control plan", err.Error()), nil
 	}
+	ev.Control = append(ev.Control, noise...)
 
 	// 2. Same consumer code and state, new module underneath (source = "../../").
 	if err := os.RemoveAll(newEx); err != nil {
@@ -129,20 +197,23 @@ func Run(o Options) (*Result, error) {
 	if err := copyDir(oldEx, newEx); err != nil {
 		return nil, err
 	}
-	if out, err := tf(newEx, "init", "-input=false", "-no-color"); err != nil {
+	out, err := initChecked(newEx)
+	if err != nil && !errors.Is(err, ErrRejected) {
 		// A raised provider floor conflicts with the old lock file; upgrading is what a consumer would do next.
-		if out, err = tf(newEx, "init", "-upgrade", "-input=false", "-no-color"); err != nil {
-			return planFailed(res, "init", out), nil
+		out, err = initChecked(newEx, "-upgrade")
+	}
+	if err != nil {
+		if errors.Is(err, ErrRejected) {
+			return stop(Rejected, "preflight (new version)", out), nil
 		}
+		return stop(PlanFailed, "init", out), nil
 	}
 	changes, err := planChanges(o, newEx)
 	if err != nil {
-		return planFailed(res, "plan", err.Error()), nil
+		return stop(PlanFailed, "plan", err.Error()), nil
 	}
-	if err := classify(res, changes, noise); err != nil {
-		return nil, err
-	}
-	return res, nil
+	ev.Upgrade = append(ev.Upgrade, changes...)
+	return ev, nil
 }
 
 func planChanges(o Options, dir string) ([]ResourceChange, error) {
@@ -294,16 +365,6 @@ func git(log io.Writer, args ...string) error {
 
 func isRemote(repo string) bool {
 	return strings.Contains(repo, "://") || strings.HasPrefix(repo, "git@")
-}
-
-func baselineFailed(r *Result, step, out string) *Result {
-	r.Status, r.Error = BaselineFailed, step+": "+tail(out)
-	return r
-}
-
-func planFailed(r *Result, step, out string) *Result {
-	r.Status, r.Error = PlanFailed, step+": "+tail(out)
-	return r
 }
 
 // tail keeps the end of terraform output, where the error is.
