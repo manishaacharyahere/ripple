@@ -219,3 +219,9 @@ the verdict is computed in a container that never runs Terraform. What
 remains trusted is the allow-listed providers themselves (fetched from the
 Terraform Registry and checked against its signatures by `terraform init`):
 a malicious provider binary could still lie in the plan it produces.
+
+## License
+
+All rights reserved. The source is public so it can be read and evaluated;
+it is not open source. Using, copying, modifying or redistributing it needs
+written permission. See [LICENSE](LICENSE).
